@@ -1,0 +1,197 @@
+#!/usr/bin/env python
+
+import argparse
+import base64
+import BaseHTTPServer
+import Cookie
+import crypt
+import getpass
+import hashlib
+import os
+import random
+import string
+import sys
+import time
+
+LOGINS_FILE = 'proxylogins'
+
+COOKIE = 'magicproxyauth'
+
+AUTHFORM = 'authform.html'
+
+LOGINS = {}
+
+authdcookies = set()
+
+
+def gencookie():
+    i = str(random.getrandbits(100000))
+    return hashlib.sha512(i).hexdigest()
+
+
+class Handler(BaseHTTPServer.BaseHTTPRequestHandler):
+
+    def do_GET(self):
+        self.log_message(str(self.headers))
+        authvalue = self.getauthcookie()
+        if self.path == '/logout':
+            # XXX This does not work as nginx caches hits to the auth server in my
+            # config, so logout is not possible. It's not a difficult fix, but not
+            # a priority for me, so this is untested.
+            if authvalue in authdcookies:
+                authdcookies.remove(authvalue)
+            self.send_response(302)
+            self.send_header('Location', '/')
+            self.end_headers()
+            return
+        if authvalue in authdcookies:
+            self.send_response(200, 'Auth')
+            self.end_headers()
+        else:
+            if authvalue is None:
+                authvalue = gencookie()
+                sendcookie = True
+            else:
+                sendcookie = False
+            authed = False
+
+            basicauth = self.headers.get('Authorization')
+            if basicauth:
+                parts  = basicauth.split()
+                if len(parts) == 2:
+                    if parts[0].lower() == 'basic':
+                        try:
+                            details = base64.b64decode(parts[1])
+                        except TypeError:
+                            details = None
+                        if details:
+                            try:
+                                username, password = details.split(':', 1)
+                            except:
+                                username, password = (None, None)
+                            if checklogin(username, password):
+                                self.log_message("Logged in via basic auth: %r", username)
+                                authdcookies.add(authvalue)
+                                authed = True
+
+            if authed:
+                self.send_response(200, 'Auth')
+            else:
+                self.send_response(401, 'Auth')
+
+            if sendcookie:
+                C = Cookie.Cookie()
+                C[COOKIE] = authvalue
+                m = C[COOKIE]
+                m['domain'] = COOKIE_DOMAIN
+                m['path'] = '/'
+                m['max-age'] = 2147483647
+                m['secure'] = True
+                self.send_header("Set-Cookie", m.OutputString())
+
+            self.end_headers()
+            self.wfile.write(open(AUTHFORM).read())
+
+    def do_POST(self):
+        username = self.headers.get('X-set-username')
+        password = self.headers.get('X-set-password')
+        authvalue = self.getauthcookie()
+        self.send_response(401, 'Auth')
+        if authvalue and checklogin(username, password):
+            authdcookies.add(authvalue)
+            self.end_headers()
+            self.wfile.write("location.reload();")
+        else:
+            time.sleep(1)
+            self.end_headers()
+            self.wfile.write("alert('Wrong');")
+
+    def getauthcookie(self):
+        cookies = Cookie.SimpleCookie(self.headers.get('cookie', ''))
+        authcookie = cookies.get(COOKIE)
+        if authcookie:
+            authvalue = authcookie.value
+            if len(authvalue) != 128:
+                authvalue = None
+        else:
+            authvalue = None
+        return authvalue
+
+
+def loadlogins(ignoreerrors=False):
+    try:
+        f = open(LOGINS_FILE)
+    except Exception as e:
+        if not ignoreerrors:
+            print("Error loading password file: {}".format(e))
+        return
+
+    for line in f:
+        line = line.strip()
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+
+        username, password = parts
+        if len(username) < 3 or len(password) < 3:
+            continue
+
+        LOGINS[username.lower()] = password
+
+def checklogin(username, password):
+    if LOGINS.has_key(username.lower()):
+        if LOGINS[username] == crypt.crypt(password, LOGINS[username]):
+            return True
+    return False
+
+def generatesalt():
+    h = ''
+    for i in xrange(8):
+        h += random.choice(string.ascii_letters)
+    return '$6${}$'.format(h)
+
+
+def addlogin(username, password):
+    loadlogins(ignoreerrors=True)
+    LOGINS[username.lower()] = crypt.crypt(password, generatesalt())
+    f = open(LOGINS_FILE, 'w')
+    for user, password in LOGINS.iteritems():
+        f.write('{}\t{}\n'.format(user, password))
+    f.close()
+
+def main():
+    global COOKIE_DOMAIN
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-d', '--domain',
+        help='Domain to use when setting the cookie, ideally your root domain. '
+        'This can also be set using the "DOMAIN" environment variable.'
+    )
+    parser.add_argument('-p', '--port', type=int,
+        help='Port to listen on, default 80'
+    )
+    parser.add_argument('-a', '--adduser', action='store_true')
+    args = parser.parse_args()
+    if not args.domain:
+        if os.environ.get('DOMAIN'):
+            args.domain = os.environ['DOMAIN']
+    if not args.port:
+        if os.environ.get('PORT'):
+            args.port = int(os.environ['PORT'])
+        else:
+            args.port = 80
+    if args.adduser:
+        username = raw_input('Username: ')
+        password = getpass.getpass('Password: ')
+        addlogin(username, password)
+    elif args.domain:
+        COOKIE_DOMAIN = args.domain
+        loadlogins()
+        server_address = ('', args.port)
+        httpd = BaseHTTPServer.HTTPServer(server_address, Handler)
+        httpd.serve_forever()
+    else:
+        print("Either -d or -a must be supplied!")
+        sys.exit(1)
+
+if __name__ == '__main__':
+    main()
